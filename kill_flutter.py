@@ -4,7 +4,7 @@
 # Supports: Android (APK) + iOS (IPA)
 # For authorized penetration testing only
 
-import struct, re, sys, os, zipfile, subprocess, argparse, plistlib
+import struct, re, sys, os, zipfile, subprocess, argparse, plistlib, socket
 
 
 # ─────────────────────────────────────────────
@@ -57,7 +57,7 @@ def print_banner():
 
     print(box_top())
     print(box_line("  K!ll Fl!utter  —  Flutter SSL Pinning Bypass", C_YELLOW))
-    print(box_line("  By: f3rb                              v2.0.0", C_GREEN))
+    print(box_line("  By: f3rb                              v2.1.0", C_GREEN))
     print(box_line("  Android (APK) + iOS (IPA) Support", C_PURPLE))
     print(box_line("  For authorized penetration testing only", C_PURPLE))
     print(box_bottom())
@@ -72,10 +72,12 @@ def print_help():
 
 \033[93mOPTIONS:\033[0m
   \033[92m-h, --help\033[0m          Show this help message
-  \033[92m-i, --ip\033[0m            Your machine IP (for proxy/iptables commands)
+  \033[92m-i, --ip\033[0m            Your machine IP (auto-detected if omitted)
   \033[92m-p, --port\033[0m          Burp Suite port (default: 8080)
   \033[92m-o, --output\033[0m        Output directory for generated files
   \033[92m--platform\033[0m          Force platform: android or ios (auto-detected from extension)
+  \033[92m--package\033[0m           Explicit package/bundle id (skips detection + interactive prompt)
+  \033[92m--no-scan\033[0m           Skip the protection/RASP pre-scan
 
 \033[93mEXAMPLES:\033[0m
   \033[90m# Android APK\033[0m
@@ -87,20 +89,37 @@ def print_help():
   \033[90m# Force platform\033[0m
   python3 kill_flutter.py app.apk --platform android -i 192.168.1.10
 
+  \033[90m# Auto-detect your machine IP (omit -i) + auto protection/RASP scan\033[0m
+  python3 kill_flutter.py app.apk
+
+  \033[90m# Explicit package/bundle id (skips detection + interactive prompt; good for scripts/CI)\033[0m
+  python3 kill_flutter.py app.apk --package com.example.app
+  python3 kill_flutter.py app.ipa --bundle-id com.example.app
+
+  \033[90m# Skip the protection/RASP pre-scan\033[0m
+  python3 kill_flutter.py app.apk --no-scan
+
+  \033[90m# Fully non-interactive run (explicit id, explicit IP)\033[0m
+  python3 kill_flutter.py app.apk --package com.example.app -i 192.168.1.10 -p 8080
+
 \033[93mWORKFLOW:\033[0m
   \033[96m1.\033[0m Auto-detects platform from file extension
-  \033[96m2.\033[0m Extracts Flutter engine binary (libflutter.so / Flutter framework)
-  \033[96m3.\033[0m Scans for ssl_client/ssl_server string anchors
-  \033[96m4.\033[0m Parses ELF (Android) or Mach-O (iOS) segments
-  \033[96m5.\033[0m Finds ADRP+ADD instruction pairs referencing both strings
-  \033[96m6.\033[0m Walks back to function prologue to get exact hook offset
-  \033[96m7.\033[0m Generates ready-to-use Frida script
-  \033[96m8.\033[0m Prints copy-paste commands for your platform
+  \033[96m2.\033[0m Auto-detects your host IP (unless -i is given)
+  \033[96m3.\033[0m Scans the app for known protections / RASP (PAIRIP, Talsec, RootBeer, ...)
+  \033[96m4.\033[0m Resolves package/bundle id (--package > aapt > aapt2 > manifest parser)
+  \033[96m5.\033[0m Extracts Flutter engine binary (libflutter.so / Flutter framework)
+  \033[96m6.\033[0m Scans for ssl_client/ssl_server string anchors
+  \033[96m7.\033[0m Parses ELF (Android) or Mach-O (iOS) segments
+  \033[96m8.\033[0m Finds ADRP+ADD instruction pairs referencing both strings
+  \033[96m9.\033[0m Walks back to function prologue to get exact hook offset
+  \033[96m10.\033[0m Generates ready-to-use Frida script (SSL + root/anti-Frida bypass)
+  \033[96m11.\033[0m Verifies the on-device frida-server, then prints copy-paste commands
 
 \033[93mREQUIREMENTS:\033[0m
   \033[92m- Python 3\033[0m
   \033[92m- Frida\033[0m             pip install frida-tools
-  \033[92m- aapt\033[0m              Android SDK build tools (Android only)
+  \033[92m- aapt\033[0m              OPTIONAL (Android) — falls back to aapt2, then a
+                      built-in binary-manifest parser if aapt is absent
   \033[92m- Rooted Android / Jailbroken iOS device\033[0m
   \033[92m- Burp Suite\033[0m        invisible proxy on all interfaces
 
@@ -143,18 +162,119 @@ def detect_platform(file_path, forced=None):
 # ─────────────────────────────────────────────
 
 def get_package_name_android(apk_path):
+    """Resolve the package name with a graceful fallback chain so the tool does
+    NOT hard-depend on aapt: aapt -> aapt2 -> binary-AndroidManifest parser."""
+    # 1) aapt (if present)
     try:
-        result = subprocess.run(
-            ['aapt', 'dump', 'badging', apk_path],
-            capture_output=True, text=True
-        )
+        result = subprocess.run(['aapt', 'dump', 'badging', apk_path],
+                                capture_output=True, text=True, timeout=30)
         for line in result.stdout.splitlines():
             if line.startswith("package:"):
                 for part in line.split():
                     if part.startswith("name="):
                         return part.split("'")[1]
+    except FileNotFoundError:
+        pass  # aapt not installed; fall through
     except Exception as e:
         print(f"\033[93m[!] aapt failed: {e}\033[0m")
+
+    # 2) aapt2 (ships in newer build-tools)
+    try:
+        result = subprocess.run(['aapt2', 'dump', 'packagename', apk_path],
+                                capture_output=True, text=True, timeout=30)
+        name = result.stdout.strip()
+        if result.returncode == 0 and name:
+            return name.splitlines()[0].strip()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    # 3) Parse the binary AndroidManifest.xml directly (no external tools)
+    pkg = _parse_package_from_axml(apk_path)
+    if pkg:
+        print(f"\033[96m[*]\033[0m Package resolved from AndroidManifest.xml (aapt not required)")
+        return pkg
+
+    return None
+
+
+def _parse_package_from_axml(apk_path):
+    """Extract the `package` attribute of <manifest> from an APK's binary
+    AndroidManifest.xml without aapt. Fully defensive: returns None on any error."""
+    try:
+        with zipfile.ZipFile(apk_path, 'r') as z:
+            axml = z.read('AndroidManifest.xml')
+    except Exception:
+        return None
+
+    try:
+        n = len(axml)
+        if n < 8 or struct.unpack_from('<H', axml, 0)[0] != 0x0003:  # RES_XML_TYPE
+            return None
+
+        # ---- string pool (first chunk after the 8-byte file header) ----
+        sp = 8
+        if struct.unpack_from('<H', axml, sp)[0] != 0x0001:  # RES_STRING_POOL_TYPE
+            return None
+        sp_size       = struct.unpack_from('<I', axml, sp + 4)[0]
+        string_count  = struct.unpack_from('<I', axml, sp + 8)[0]
+        flags         = struct.unpack_from('<I', axml, sp + 16)[0]
+        strings_start = struct.unpack_from('<I', axml, sp + 20)[0]
+        is_utf8       = bool(flags & 0x100)
+        offsets_base  = sp + 28
+        data_base     = sp + strings_start
+
+        def get_string(idx):
+            if idx < 0 or idx >= string_count:
+                return None
+            so = struct.unpack_from('<I', axml, offsets_base + idx * 4)[0]
+            pos = data_base + so
+            if pos < 0 or pos >= n:
+                return None
+            if is_utf8:
+                # (char-count)(byte-count)(bytes)(0x00); each length is 1 or 2 bytes
+                c = axml[pos]; pos += 2 if (c & 0x80) else 1
+                b = axml[pos]
+                if b & 0x80:
+                    blen = ((b & 0x7f) << 8) | axml[pos + 1]; pos += 2
+                else:
+                    blen = b; pos += 1
+                return axml[pos:pos + blen].decode('utf-8', 'ignore')
+            else:
+                c = struct.unpack_from('<H', axml, pos)[0]
+                if c & 0x8000:
+                    c = ((c & 0x7fff) << 16) | struct.unpack_from('<H', axml, pos + 2)[0]; pos += 4
+                else:
+                    pos += 2
+                return axml[pos:pos + c * 2].decode('utf-16-le', 'ignore')
+
+        # ---- walk chunks; the first START_ELEMENT is <manifest> ----
+        pos = sp + sp_size
+        while pos + 8 <= n:
+            ctype  = struct.unpack_from('<H', axml, pos)[0]
+            chsize = struct.unpack_from('<I', axml, pos + 4)[0]
+            if chsize <= 0:
+                break
+            if ctype == 0x0102:  # RES_XML_START_ELEMENT_TYPE
+                name_idx   = struct.unpack_from('<I', axml, pos + 20)[0]
+                attr_start = struct.unpack_from('<H', axml, pos + 24)[0]
+                attr_size  = struct.unpack_from('<H', axml, pos + 26)[0] or 20
+                attr_count = struct.unpack_from('<H', axml, pos + 28)[0]
+                if get_string(name_idx) == 'manifest':
+                    abase = pos + 16 + attr_start
+                    for a in range(attr_count):
+                        ao = abase + a * attr_size
+                        if ao + 12 > n:
+                            break
+                        a_name = struct.unpack_from('<I', axml, ao + 4)[0]
+                        a_raw  = struct.unpack_from('<i', axml, ao + 8)[0]  # signed; -1 = none
+                        if get_string(a_name) == 'package' and a_raw != -1:
+                            return get_string(a_raw)
+                    return None  # manifest found, no package attr
+            pos += chsize
+    except Exception:
+        return None
     return None
 
 
@@ -180,6 +300,147 @@ def get_bundle_id_ios(ipa_path):
     except Exception as e:
         print(f"\033[93m[!] Could not read Info.plist from zip: {e}\033[0m")
     return None
+
+
+# ─────────────────────────────────────────────
+#  HOST IP AUTO-DETECTION
+# ─────────────────────────────────────────────
+
+def detect_host_ip():
+    """Best-effort LAN IP of this machine. Uses a UDP socket 'connect' which
+    selects a source interface WITHOUT sending any packets. Returns None on
+    failure (offline, etc.)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(('8.8.8.8', 80))  # no traffic is sent for a UDP connect
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        if ip and not ip.startswith('127.'):
+            return ip
+    except Exception:
+        pass
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith('127.'):
+            return ip
+    except Exception:
+        pass
+    return None
+
+
+# ─────────────────────────────────────────────
+#  PROTECTION / RASP SCANNER
+# ─────────────────────────────────────────────
+
+def scan_protections(app_path, platform):
+    """Fingerprint known anti-tamper / RASP / root-detection protections inside
+    the APK/IPA so the operator is warned BEFORE hitting a runtime crash.
+    Read-only (inspects zip entries + dex/binary strings). Returns a list of
+    (name, description, strategy) tuples."""
+
+    # name -> (description, strategy)
+    STRATEGY = {
+        'Google PAIRIP':        ('VM-based anti-tamper + anti-Frida + anti-repackaging',
+                                 'Expect Frida detection & repackaging blocks. Try Magisk DenyList+Zygisk+Shamiko, a stealth/renamed frida-server on a custom port, or an older app version.'),
+        'Talsec / freeRASP':    ('RASP: root/hook/debugger/emulator detection',
+                                 'Hide root (Magisk DenyList+Shamiko) and run frida-server stealthily; freeRASP also flags Frida.'),
+        'Promon SHIELD':        ('Commercial app shielding / anti-tamper',
+                                 'Strong anti-instrumentation; Magisk hiding + stealth Frida, expect resistance.'),
+        'Appdome':              ('No-code app shielding (root/Frida/repackage detection)',
+                                 'Magisk hiding + stealth Frida; repackaging is blocked.'),
+        'DexGuard':             ('GuardSquare RASP + obfuscation',
+                                 'May detect hooks/root; hide root and instrument carefully.'),
+        'JailMonkey':           ('Root/jailbreak detection plugin',
+                                 'Handled at runtime by the generated script + Magisk hiding.'),
+        'flutter_jailbreak_detection': ('Flutter root/jailbreak plugin (uses RootBeer)',
+                                 'Handled by the generated script (RootBeer hooks).'),
+        'RootBeer':             ('Java root-detection library',
+                                 'Handled by the generated script (RootBeer hooks).'),
+        'IOSSecuritySuite':     ('iOS jailbreak/debugger/hook detection',
+                                 'Hook its checks at runtime; use a jailbreak-hiding tweak (e.g. Shadow/A-Bypass).'),
+        'TrustKit':             ('iOS certificate pinning framework',
+                                 'Pinning also enforced natively; the SSL hook + a TrustKit bypass may both be needed.'),
+    }
+    HARD = {'Google PAIRIP', 'Talsec / freeRASP', 'Promon SHIELD', 'Appdome', 'DexGuard'}
+
+    findings = {}  # name -> (desc, strat), dedup by name
+
+    try:
+        with zipfile.ZipFile(app_path, 'r') as z:
+            names = z.namelist()
+            basenames = {nm.split('/')[-1] for nm in names}
+
+            # native .so / framework fingerprints (exact basename)
+            NATIVE = {
+                'libpairipcore.so':   'Google PAIRIP',
+                'libtoolchecker.so':  'Talsec / freeRASP',
+                'libTalsecRuntime.so':'Talsec / freeRASP',
+                'libshield.so':       'Promon SHIELD',
+                'libdexguard.so':     'DexGuard',
+                'libjailmonkey.so':   'JailMonkey',
+            }
+            for lib, nm in NATIVE.items():
+                if lib in basenames and nm not in findings:
+                    findings[nm] = STRATEGY.get(nm, ('native protection library', 'Investigate manually.'))
+
+            # path-substring fingerprints (Appdome / iOS frameworks)
+            lowered = [nm.lower() for nm in names]
+            if any('appdome' in nm for nm in lowered) and 'Appdome' not in findings:
+                findings['Appdome'] = STRATEGY['Appdome']
+            if platform == 'ios':
+                for marker, nm in [('iossecuritysuite', 'IOSSecuritySuite'),
+                                   ('trustkit', 'TrustKit'),
+                                   ('talsec', 'Talsec / freeRASP')]:
+                    if any(marker in p for p in lowered) and nm not in findings:
+                        findings[nm] = STRATEGY.get(nm, ('iOS protection', 'Investigate manually.'))
+
+            # dex string fingerprints (Java/Kotlin libraries), Android only
+            if platform == 'android':
+                DEX = {
+                    b'com/scottyab/rootbeer':          'RootBeer',
+                    b'gantix/jailmonkey':              'JailMonkey',
+                    b'flutter_jailbreak_detection':    'flutter_jailbreak_detection',
+                    b'com/aheaditec/talsec':           'Talsec / freeRASP',
+                }
+                dex_entries = [nm for nm in names
+                               if re.match(r'^classes\d*\.dex$', nm.split('/')[-1])]
+                for dn in dex_entries:
+                    try:
+                        blob = z.read(dn)
+                    except Exception:
+                        continue
+                    for marker, nm in DEX.items():
+                        if nm not in findings and marker in blob:
+                            findings[nm] = STRATEGY.get(nm, ('detected in dex', 'Investigate manually.'))
+    except Exception as e:
+        print(f"\033[93m[!] Protection scan skipped: {e}\033[0m")
+        return []
+
+    # ---- report ----
+    print("")
+    print(box_top())
+    print(box_line("        PROTECTION / RASP SCAN", C_YELLOW))
+    print(box_bottom())
+    if not findings:
+        print(f"\033[92m[+]\033[0m No known protections detected (root/RASP/anti-tamper).")
+        return []
+
+    result = []
+    hard_hit = False
+    for nm, (desc, strat) in findings.items():
+        hard = nm in HARD
+        hard_hit = hard_hit or hard
+        tag = f"{C_RED}[HARD]{C_RESET}" if hard else f"{C_YELLOW}[soft]{C_RESET}"
+        print(f"{tag} {C_PURPLE}{nm}{C_RESET} — {desc}")
+        print(f"       {C_GREY}strategy:{C_RESET} {strat}")
+        result.append((nm, desc, strat))
+
+    if hard_hit:
+        print(f"\n{C_RED}[!] Commercial anti-tamper present — dynamic instrumentation may crash "
+              f"the app (e.g. SIGSEGV in the protection lib). Read the per-item strategy above.{C_RESET}")
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -806,11 +1067,15 @@ def main():
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('app', nargs='?', help='Path to APK or IPA')
-    parser.add_argument('-i', '--ip', default='<YOUR_IP>', help='Your machine IP')
+    parser.add_argument('-i', '--ip', default='<YOUR_IP>', help='Your machine IP (auto-detected if omitted)')
     parser.add_argument('-p', '--port', default='8080', help='Burp port')
     parser.add_argument('-o', '--output', help='Output directory')
     parser.add_argument('--platform', choices=['android', 'ios'], help='Force platform')
     parser.add_argument('--device-ip', default='<DEVICE_IP>', help='iOS device IP (for SSH iptables)')
+    parser.add_argument('--package', '--bundle-id', dest='package', default=None,
+                        help='Explicit package name / bundle id (skips auto-detection and the interactive prompt)')
+    parser.add_argument('--no-scan', action='store_true',
+                        help='Skip the protection/RASP pre-scan')
     args = parser.parse_args()
 
     print_banner()
@@ -829,6 +1094,11 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     ip        = args.ip
+    if ip == '<YOUR_IP>':
+        detected = detect_host_ip()
+        if detected:
+            ip = detected
+            print(f"\033[96m[*]\033[0m Auto-detected host IP: \033[93m{ip}\033[0m (override with -i)")
     port      = args.port
     proxy     = ip + ":" + port
     device_ip = args.device_ip
@@ -838,8 +1108,15 @@ def main():
     print(f"\033[96m[*]\033[0m Output   : {out_dir}")
     print(f"\033[96m[*]\033[0m Proxy    : {proxy}")
 
-    # Step 1: Get identifier
-    if platform == 'android':
+    # Step 0: Protection / RASP pre-scan (warn before we hit a runtime crash)
+    if not args.no_scan:
+        scan_protections(app_path, platform)
+
+    # Step 1: Get identifier (explicit flag > auto-detect > interactive prompt)
+    if args.package:
+        package = args.package.strip()
+        print(f"\033[92m[+]\033[0m Package (from --package): \033[93m{package}\033[0m")
+    elif platform == 'android':
         package = get_package_name_android(app_path)
         if package:
             print(f"\033[92m[+]\033[0m Package: \033[93m{package}\033[0m")
