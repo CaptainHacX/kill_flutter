@@ -4,7 +4,7 @@
 # Supports: Android (APK) + iOS (IPA)
 # For authorized penetration testing only
 
-import struct, re, sys, os, zipfile, subprocess, argparse, plistlib, socket
+import struct, re, sys, os, zipfile, subprocess, argparse, plistlib, socket, shutil
 
 
 # ─────────────────────────────────────────────
@@ -78,6 +78,14 @@ def print_help():
   \033[92m--platform\033[0m          Force platform: android or ios (auto-detected from extension)
   \033[92m--package\033[0m           Explicit package/bundle id (skips detection + interactive prompt)
   \033[92m--no-scan\033[0m           Skip the protection/RASP pre-scan
+  \033[92m--from-device\033[0m       Pull the app (all splits) from a device by package name (Android)
+  \033[92m--serial\033[0m            adb / Frida device serial (for --from-device and --run)
+  \033[92m--run\033[0m               Spawn the app via Frida and verify the bypass actually loaded
+  \033[92m--run-timeout\033[0m       Seconds to wait for the hook with --run (default 15)
+
+\033[93mINPUT TYPES (Android):\033[0m
+  a single .apk, a folder of split APKs, an .xapk/.apks/.apkm bundle,
+  or --from-device to pull straight off a connected phone.
 
 \033[93mEXAMPLES:\033[0m
   \033[90m# Android APK\033[0m
@@ -101,6 +109,19 @@ def print_help():
 
   \033[90m# Fully non-interactive run (explicit id, explicit IP)\033[0m
   python3 kill_flutter.py app.apk --package com.example.app -i 192.168.1.10 -p 8080
+
+  \033[90m# Pull the app straight off a connected phone (no manual adb pull)\033[0m
+  python3 kill_flutter.py --from-device com.example.app
+
+  \033[90m# Folder of split APKs, or an .xapk/.apks bundle\033[0m
+  python3 kill_flutter.py ./coindcx_splits/
+  python3 kill_flutter.py app.xapk
+
+  \033[90m# Generate AND auto-verify the bypass on-device (spawns via Frida)\033[0m
+  python3 kill_flutter.py --from-device com.example.app --run
+
+  \033[90m# Pick a specific device when several are attached\033[0m
+  python3 kill_flutter.py --from-device com.example.app --serial RZ8R32PFELT --run
 
 \033[93mWORKFLOW:\033[0m
   \033[96m1.\033[0m Auto-detects platform from file extension
@@ -147,13 +168,15 @@ def print_help():
 def detect_platform(file_path, forced=None):
     if forced:
         return forced.lower()
+    if os.path.isdir(file_path):
+        return 'android'  # a folder of split APKs
     ext = os.path.splitext(file_path)[1].lower()
-    if ext == '.apk':
+    if ext in ('.apk', '.xapk', '.apks', '.apkm'):
         return 'android'
     elif ext == '.ipa':
         return 'ios'
     else:
-        print("\033[93m[!] Cannot detect platform from extension. Use --platform android or --platform ios\033[0m")
+        print("\033[93m[!] Cannot detect platform from input. Use --platform android or --platform ios\033[0m")
         sys.exit(1)
 
 
@@ -303,6 +326,116 @@ def get_bundle_id_ios(ipa_path):
 
 
 # ─────────────────────────────────────────────
+#  DEVICE / INPUT HELPERS  (--from-device, bundles, dirs)
+# ─────────────────────────────────────────────
+
+ABI_PREFERENCE = ['arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86']
+
+
+def _valid_package(pkg):
+    """Strict Android package-name validation to prevent command injection in
+    adb calls and path traversal in local filenames."""
+    return bool(pkg) and re.match(r'^[A-Za-z0-9_][A-Za-z0-9_.]{0,254}$', pkg) is not None \
+        and '..' not in pkg and pkg[0] != '.' and pkg[-1] != '.'
+
+
+def resolve_serial(preferred=None):
+    """Pick a single adb device. Returns (serial, error_message)."""
+    try:
+        r = subprocess.run(['adb', 'devices'], capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        return None, "adb not found on PATH"
+    except Exception as e:
+        return None, f"adb error: {e}"
+    online = []
+    for line in r.stdout.splitlines()[1:]:
+        line = line.strip()
+        if '\t' in line:
+            s, state = (line.split('\t') + [''])[:2]
+            if state.strip() == 'device':
+                online.append(s)
+    pref = preferred or os.environ.get('ANDROID_SERIAL')
+    if pref:
+        return (pref, None) if pref in online else (None, f"device '{pref}' is not online")
+    if not online:
+        return None, "no online adb device (check 'adb devices')"
+    if len(online) > 1:
+        return None, f"multiple devices {online} — pass --serial <id>"
+    return online[0], None
+
+
+def pull_apks_from_device(package, serial, out_dir):
+    """Resolve every split of `package` via `pm path` and pull them locally.
+    Returns the local directory holding the pulled APKs. Raises on failure.
+    All adb args are passed as a list (no shell); package + remote paths are
+    validated to avoid injection / traversal."""
+    if not _valid_package(package):
+        raise ValueError(f"invalid package name: {package!r}")
+    adb = ['adb', '-s', serial]
+
+    print(f"\033[96m[*]\033[0m Resolving APK paths on device for {package} ...")
+    r = subprocess.run(adb + ['shell', 'pm', 'path', package],
+                       capture_output=True, text=True, timeout=60)
+    remotes = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith('package:'):
+            rp = line[len('package:'):].strip()
+            # only accept absolute paths ending in .apk (defensive)
+            if rp.startswith('/') and rp.endswith('.apk') and '\n' not in rp:
+                remotes.append(rp)
+    if not remotes:
+        raise RuntimeError(f"package '{package}' not found on device (is it installed?)")
+
+    dest = os.path.join(out_dir, 'pulled_' + package)
+    os.makedirs(dest, exist_ok=True)
+    print(f"\033[96m[*]\033[0m Pulling {len(remotes)} APK(s) to {dest}")
+    pulled = []
+    for rp in remotes:
+        r2 = subprocess.run(adb + ['pull', rp, dest],
+                            capture_output=True, text=True, timeout=300)
+        local = os.path.join(dest, os.path.basename(rp))
+        if os.path.exists(local):
+            print(f"\033[92m[+]\033[0m   {os.path.basename(rp)}")
+            pulled.append(local)
+        else:
+            print(f"\033[93m[!]\033[0m   failed to pull {rp}: {r2.stderr.strip()}")
+    if not pulled:
+        raise RuntimeError("failed to pull any APK from device")
+    return dest
+
+
+def list_android_apks(input_path, out_dir):
+    """Normalize an Android input into a list of .apk paths. Accepts a single
+    .apk, a directory of APKs, or an .xapk/.apks/.apkm bundle (zip-slip safe)."""
+    if os.path.isdir(input_path):
+        return sorted(os.path.join(input_path, f) for f in os.listdir(input_path)
+                      if f.lower().endswith('.apk'))
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext in ('.xapk', '.apks', '.apkm', '.zip'):
+        dest = os.path.join(out_dir, 'bundle_extracted')
+        os.makedirs(dest, exist_ok=True)
+        apks = []
+        try:
+            with zipfile.ZipFile(input_path, 'r') as z:
+                for name in z.namelist():
+                    if name.lower().endswith('.apk'):
+                        safe = os.path.basename(name)  # zip-slip guard
+                        if not safe:
+                            continue
+                        tp = os.path.join(dest, safe)
+                        with z.open(name) as src, open(tp, 'wb') as dst:
+                            shutil.copyfileobj(src, dst)
+                        apks.append(tp)
+        except Exception as e:
+            print(f"\033[91m[-] Failed to read bundle {input_path}: {e}\033[0m")
+        return apks
+    if ext == '.apk':
+        return [input_path]
+    return []
+
+
+# ─────────────────────────────────────────────
 #  HOST IP AUTO-DETECTION
 # ─────────────────────────────────────────────
 
@@ -334,11 +467,13 @@ def detect_host_ip():
 #  PROTECTION / RASP SCANNER
 # ─────────────────────────────────────────────
 
-def scan_protections(app_path, platform):
+def scan_protections(targets, platform):
     """Fingerprint known anti-tamper / RASP / root-detection protections inside
-    the APK/IPA so the operator is warned BEFORE hitting a runtime crash.
-    Read-only (inspects zip entries + dex/binary strings). Returns a list of
-    (name, description, strategy) tuples."""
+    the app so the operator is warned BEFORE hitting a runtime crash.
+    `targets` is a list of APK/IPA paths (base + splits). Read-only (inspects
+    zip entries + dex/binary strings). Returns a list of (name, desc, strategy)."""
+    if isinstance(targets, str):
+        targets = [targets]
 
     # name -> (description, strategy)
     STRATEGY = {
@@ -365,58 +500,57 @@ def scan_protections(app_path, platform):
     }
     HARD = {'Google PAIRIP', 'Talsec / freeRASP', 'Promon SHIELD', 'Appdome', 'DexGuard'}
 
+    NATIVE = {
+        'libpairipcore.so':   'Google PAIRIP',
+        'libtoolchecker.so':  'Talsec / freeRASP',
+        'libTalsecRuntime.so':'Talsec / freeRASP',
+        'libshield.so':       'Promon SHIELD',
+        'libdexguard.so':     'DexGuard',
+        'libjailmonkey.so':   'JailMonkey',
+    }
+    DEX = {
+        b'com/scottyab/rootbeer':          'RootBeer',
+        b'gantix/jailmonkey':              'JailMonkey',
+        b'flutter_jailbreak_detection':    'flutter_jailbreak_detection',
+        b'com/aheaditec/talsec':           'Talsec / freeRASP',
+    }
+
     findings = {}  # name -> (desc, strat), dedup by name
 
-    try:
-        with zipfile.ZipFile(app_path, 'r') as z:
-            names = z.namelist()
-            basenames = {nm.split('/')[-1] for nm in names}
+    for tgt in targets:
+        try:
+            with zipfile.ZipFile(tgt, 'r') as z:
+                names = z.namelist()
+                basenames = {nm.split('/')[-1] for nm in names}
 
-            # native .so / framework fingerprints (exact basename)
-            NATIVE = {
-                'libpairipcore.so':   'Google PAIRIP',
-                'libtoolchecker.so':  'Talsec / freeRASP',
-                'libTalsecRuntime.so':'Talsec / freeRASP',
-                'libshield.so':       'Promon SHIELD',
-                'libdexguard.so':     'DexGuard',
-                'libjailmonkey.so':   'JailMonkey',
-            }
-            for lib, nm in NATIVE.items():
-                if lib in basenames and nm not in findings:
-                    findings[nm] = STRATEGY.get(nm, ('native protection library', 'Investigate manually.'))
+                for lib, nm in NATIVE.items():
+                    if lib in basenames and nm not in findings:
+                        findings[nm] = STRATEGY.get(nm, ('native protection library', 'Investigate manually.'))
 
-            # path-substring fingerprints (Appdome / iOS frameworks)
-            lowered = [nm.lower() for nm in names]
-            if any('appdome' in nm for nm in lowered) and 'Appdome' not in findings:
-                findings['Appdome'] = STRATEGY['Appdome']
-            if platform == 'ios':
-                for marker, nm in [('iossecuritysuite', 'IOSSecuritySuite'),
-                                   ('trustkit', 'TrustKit'),
-                                   ('talsec', 'Talsec / freeRASP')]:
-                    if any(marker in p for p in lowered) and nm not in findings:
-                        findings[nm] = STRATEGY.get(nm, ('iOS protection', 'Investigate manually.'))
+                lowered = [nm.lower() for nm in names]
+                if any('appdome' in nm for nm in lowered) and 'Appdome' not in findings:
+                    findings['Appdome'] = STRATEGY['Appdome']
+                if platform == 'ios':
+                    for marker, nm in [('iossecuritysuite', 'IOSSecuritySuite'),
+                                       ('trustkit', 'TrustKit'),
+                                       ('talsec', 'Talsec / freeRASP')]:
+                        if any(marker in p for p in lowered) and nm not in findings:
+                            findings[nm] = STRATEGY.get(nm, ('iOS protection', 'Investigate manually.'))
 
-            # dex string fingerprints (Java/Kotlin libraries), Android only
-            if platform == 'android':
-                DEX = {
-                    b'com/scottyab/rootbeer':          'RootBeer',
-                    b'gantix/jailmonkey':              'JailMonkey',
-                    b'flutter_jailbreak_detection':    'flutter_jailbreak_detection',
-                    b'com/aheaditec/talsec':           'Talsec / freeRASP',
-                }
-                dex_entries = [nm for nm in names
-                               if re.match(r'^classes\d*\.dex$', nm.split('/')[-1])]
-                for dn in dex_entries:
-                    try:
-                        blob = z.read(dn)
-                    except Exception:
-                        continue
-                    for marker, nm in DEX.items():
-                        if nm not in findings and marker in blob:
-                            findings[nm] = STRATEGY.get(nm, ('detected in dex', 'Investigate manually.'))
-    except Exception as e:
-        print(f"\033[93m[!] Protection scan skipped: {e}\033[0m")
-        return []
+                if platform == 'android':
+                    dex_entries = [nm for nm in names
+                                   if re.match(r'^classes\d*\.dex$', nm.split('/')[-1])]
+                    for dn in dex_entries:
+                        try:
+                            blob = z.read(dn)
+                        except Exception:
+                            continue
+                        for marker, nm in DEX.items():
+                            if nm not in findings and marker in blob:
+                                findings[nm] = STRATEGY.get(nm, ('detected in dex', 'Investigate manually.'))
+        except Exception as e:
+            print(f"\033[93m[!] Protection scan skipped for {os.path.basename(str(tgt))}: {e}\033[0m")
+            continue
 
     # ---- report ----
     print("")
@@ -447,18 +581,51 @@ def scan_protections(app_path, platform):
 #  ANDROID — EXTRACT libflutter.so
 # ─────────────────────────────────────────────
 
-def extract_flutter_android(apk_path, out_dir):
-    so_path = os.path.join(out_dir, 'libflutter.so')
-    print(f"\033[96m[*]\033[0m Extracting libflutter.so from APK...")
-    with zipfile.ZipFile(apk_path, 'r') as z:
-        for name in z.namelist():
-            if 'arm64-v8a/libflutter.so' in name:
-                print(f"\033[92m[+]\033[0m Found: {name}")
-                with z.open(name) as src, open(so_path, 'wb') as dst:
-                    dst.write(src.read())
-                return so_path
-    print("\033[91m[-] libflutter.so (arm64-v8a) not found — is this a Flutter APK?\033[0m")
-    return None
+def extract_flutter_android(apks, out_dir):
+    """Find & extract libflutter.so from a list of APK paths (base + splits).
+    Searches every APK and every ABI, preferring arm64-v8a.
+    Returns (so_path, abi) or (None, None)."""
+    if not apks:
+        print("\033[91m[-] No .apk found in the given input.\033[0m")
+        return None, None
+
+    print(f"\033[96m[*]\033[0m Searching {len(apks)} APK(s) for libflutter.so ...")
+    found = {}  # abi -> (apk_path, entry_name)
+    for ap in apks:
+        try:
+            with zipfile.ZipFile(ap, 'r') as z:
+                for name in z.namelist():
+                    m = re.match(r'lib/([^/]+)/libflutter\.so$', name)
+                    if m and m.group(1) not in found:
+                        found[m.group(1)] = (ap, name)
+        except Exception:
+            continue
+
+    if not found:
+        print("\033[91m[-] libflutter.so not found in any APK.\033[0m")
+        print("\033[93m    If this is a split app, the native lib lives in the ABI split "
+              "(split_config.*_v8a.apk). Pass the whole bundle/folder, or use --from-device.\033[0m")
+        return None, None
+
+    order = ABI_PREFERENCE + [a for a in found if a not in ABI_PREFERENCE]
+    for abi in order:
+        if abi not in found:
+            continue
+        ap, name = found[abi]
+        so_path = os.path.join(out_dir, 'libflutter.so')
+        try:
+            with zipfile.ZipFile(ap, 'r') as z, z.open(name) as src, open(so_path, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+        except Exception as e:
+            print(f"\033[91m[-] Failed to extract {name}: {e}\033[0m")
+            return None, None
+        print(f"\033[92m[+]\033[0m Found libflutter.so [{abi}] in {os.path.basename(ap)}")
+        print(f"\033[92m[+]\033[0m Available ABIs: {', '.join(found.keys())}")
+        if abi != 'arm64-v8a':
+            print(f"\033[93m[!] Selected '{abi}' (no arm64-v8a present). Offset auto-detection "
+                  f"supports arm64-v8a only; the binary is extracted for manual analysis.\033[0m")
+        return so_path, abi
+    return None, None
 
 
 # ─────────────────────────────────────────────
@@ -603,6 +770,20 @@ def find_offset(binary_path, platform):
     print(f"\033[96m[*]\033[0m Loading binary: {binary_path}")
     with open(binary_path, 'rb') as f:
         data = f.read()
+
+    # Arch gate (Android/ELF): the ADRP+ADD scanner is AArch64-only. Refuse to
+    # guess on other architectures rather than emit a wrong (dangerous) offset.
+    if platform == 'android' and len(data) >= 0x14 and data[:4] == b'\x7fELF':
+        ei_class  = data[4]                                    # 1=32-bit, 2=64-bit
+        e_machine = struct.unpack_from('<H', data, 0x12)[0]    # 0xB7 = AArch64
+        if ei_class != 2 or e_machine != 0xB7:
+            names = {0x28: 'ARM (32-bit)', 0x3E: 'x86-64', 0x03: 'x86', 0xB7: 'AArch64'}
+            arch = names.get(e_machine, f'machine=0x{e_machine:x}')
+            klass = '64-bit' if ei_class == 2 else '32-bit'
+            print(f"\033[91m[-] Offset auto-detection supports arm64-v8a (AArch64) only.\033[0m")
+            print(f"\033[93m    This binary is {klass} {arch}. Use an arm64-v8a build/device, "
+                  f"or analyze it manually.\033[0m")
+            return None
 
     # Find string anchors
     ssl_client = [m.start() for m in re.finditer(b'ssl_client\x00', data)]
@@ -983,6 +1164,116 @@ def preflight_frida_check(package):
 
 
 # ─────────────────────────────────────────────
+#  RUN & VERIFY  (--run)
+# ─────────────────────────────────────────────
+
+def run_and_verify(package, script_path, serial, run_timeout):
+    """Spawn the app via Frida with the generated script, confirm the SSL hook
+    actually loaded, and detect anti-tamper/RASP crashes. Read-only w.r.t. the
+    device (no iptables). Frida is imported lazily so the rest of the tool works
+    without it."""
+    print("")
+    print(box_top())
+    print(box_line("          RUN & VERIFY (Frida)", C_YELLOW))
+    print(box_bottom())
+
+    try:
+        import frida
+    except ImportError:
+        print(f"{C_YELLOW}[!] --run needs the Frida python module: pip install frida{C_RESET}")
+        return
+    import time
+
+    if not _valid_package(package):
+        print(f"{C_RED}[-] Refusing to spawn: invalid package name {package!r}{C_RESET}")
+        return
+    try:
+        with open(script_path, 'r', encoding='utf-8') as f:
+            src = f.read()
+    except Exception as e:
+        print(f"{C_RED}[-] Cannot read script: {e}{C_RESET}")
+        return
+
+    try:
+        dev = frida.get_device(serial, timeout=10) if serial else frida.get_usb_device(timeout=10)
+    except Exception as e:
+        print(f"{C_RED}[-] No Frida device: {e}{C_RESET}")
+        print(f"{C_YELLOW}    Make sure frida-server is running (see the pre-flight above).{C_RESET}")
+        return
+
+    logs = []
+    state = {'crashed': False, 'reason': None}
+
+    def on_message(message, data):
+        t = message.get('type')
+        if t == 'log':
+            payload = str(message.get('payload', ''))
+            logs.append(payload)
+            print(f"   {C_GREY}[app]{C_RESET} {payload}")
+        elif t == 'send':
+            logs.append(str(message.get('payload', '')))
+        elif t == 'error':
+            print(f"   {C_RED}[script error]{C_RESET} {message.get('stack', message.get('description', ''))}")
+
+    def on_detached(reason, *_):
+        state['reason'] = reason
+        if reason in ('process-terminated', 'process-replaced'):
+            state['crashed'] = True
+
+    session = None
+    try:
+        pid = dev.spawn([package])
+        session = dev.attach(pid)
+        session.on('detached', on_detached)
+        script = session.create_script(src)
+        script.on('message', on_message)
+        script.load()
+        dev.resume(pid)
+        print(f"{C_GREEN}[+]{C_RESET} Spawned {package} (pid {pid}); watching for up to {run_timeout}s ...")
+    except Exception as e:
+        print(f"{C_RED}[-] spawn/attach failed: {e}{C_RESET}")
+        try:
+            if session:
+                session.detach()
+        except Exception:
+            pass
+        return
+
+    ok = False
+    steps = int(max(3, run_timeout) / 0.5)
+    for _ in range(steps):
+        if state['crashed']:
+            break
+        if any('pinning bypass installed' in l for l in logs):
+            ok = True
+            break
+        time.sleep(0.5)
+
+    if state['crashed']:
+        print(f"{C_RED}[-] App terminated (reason: {state['reason']}). Likely anti-tamper / RASP "
+              f"(e.g. PAIRIP) killed it. See the protection scan above.{C_RESET}")
+    elif ok:
+        print(f"{C_GREEN}[+] VERIFIED: SSL pinning bypass installed and the app is alive.{C_RESET}")
+    else:
+        print(f"{C_YELLOW}[!] Hook not confirmed within {run_timeout}s (app still alive). "
+              f"Check the [app] logs above; the module may load slower.{C_RESET}")
+
+    # For interactive shells, keep the session so traffic can be captured; else detach.
+    if ok and not state['crashed'] and sys.stdin.isatty():
+        print(f"{C_CYAN}[*]{C_RESET} App running with hooks. Press Ctrl+C to stop.")
+        try:
+            while not state['crashed']:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print(f"\n{C_CYAN}[*]{C_RESET} Stopping.")
+    try:
+        if session:
+            session.detach()
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────
 #  PRINT FINAL COMMANDS
 # ─────────────────────────────────────────────
 
@@ -1076,24 +1367,62 @@ def main():
                         help='Explicit package name / bundle id (skips auto-detection and the interactive prompt)')
     parser.add_argument('--no-scan', action='store_true',
                         help='Skip the protection/RASP pre-scan')
+    parser.add_argument('--from-device', metavar='PACKAGE', default=None,
+                        help='Pull the app (all splits) from a connected device by package name (Android)')
+    parser.add_argument('--serial', default=None,
+                        help='adb / Frida device serial (for --from-device and --run)')
+    parser.add_argument('--run', action='store_true',
+                        help='After generating, spawn the app via Frida and verify the bypass loaded')
+    parser.add_argument('--run-timeout', type=int, default=15,
+                        help='Seconds to wait for the hook when using --run (default 15)')
     args = parser.parse_args()
 
     print_banner()
 
-    app_path = args.app
-    if not app_path:
-        print("\033[91m[-] No APK/IPA provided. Use -h for help.\033[0m")
-        sys.exit(1)
+    serial = args.serial
+    package = args.package.strip() if args.package else None
+    source_display = args.app
 
-    if not os.path.exists(app_path):
-        print(f"\033[91m[-] File not found: {app_path}\033[0m")
-        sys.exit(1)
+    # ---- Acquire input: either pull from device, or use a local path ----
+    if args.from_device:
+        platform = (args.platform or 'android')
+        if platform != 'android':
+            print("\033[91m[-] --from-device is Android only.\033[0m"); sys.exit(1)
+        if not package:
+            package = args.from_device.strip()
+        if not _valid_package(package):
+            print(f"\033[91m[-] Invalid package name: {package!r}\033[0m"); sys.exit(1)
+        serial, err = resolve_serial(serial)
+        if not serial:
+            print(f"\033[91m[-] {err}\033[0m"); sys.exit(1)
+        out_dir = args.output or os.path.join(os.getcwd(), 'kf_' + package)
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            source = pull_apks_from_device(package, serial, out_dir)  # a directory
+        except Exception as e:
+            print(f"\033[91m[-] from-device failed: {e}\033[0m"); sys.exit(1)
+        source_display = source
+    else:
+        app_path = args.app
+        if not app_path:
+            print("\033[91m[-] No APK/IPA provided (or use --from-device). Use -h for help.\033[0m")
+            sys.exit(1)
+        if not os.path.exists(app_path):
+            print(f"\033[91m[-] Path not found: {app_path}\033[0m")
+            sys.exit(1)
+        platform = detect_platform(app_path, args.platform)
+        if args.output:
+            out_dir = args.output
+        elif os.path.isdir(app_path):
+            out_dir = app_path
+        else:
+            out_dir = os.path.dirname(os.path.abspath(app_path))
+        os.makedirs(out_dir, exist_ok=True)
+        source = app_path
+        source_display = app_path
 
-    platform = detect_platform(app_path, args.platform)
-    out_dir  = args.output or os.path.dirname(os.path.abspath(app_path))
-    os.makedirs(out_dir, exist_ok=True)
-
-    ip        = args.ip
+    # ---- Proxy / IP ----
+    ip = args.ip
     if ip == '<YOUR_IP>':
         detected = detect_host_ip()
         if detected:
@@ -1104,26 +1433,31 @@ def main():
     device_ip = args.device_ip
 
     print(f"\033[96m[*]\033[0m Platform : \033[93m{platform.upper()}\033[0m")
-    print(f"\033[96m[*]\033[0m App      : {app_path}")
+    print(f"\033[96m[*]\033[0m Source   : {source_display}")
     print(f"\033[96m[*]\033[0m Output   : {out_dir}")
     print(f"\033[96m[*]\033[0m Proxy    : {proxy}")
 
+    # Normalize Android input into a concrete list of APKs (base + splits)
+    apk_list = list_android_apks(source, out_dir) if platform == 'android' else []
+    if platform == 'android' and not apk_list:
+        print("\033[91m[-] No APK found in the given input.\033[0m"); sys.exit(1)
+
     # Step 0: Protection / RASP pre-scan (warn before we hit a runtime crash)
     if not args.no_scan:
-        scan_protections(app_path, platform)
+        scan_protections(apk_list if platform == 'android' else [source], platform)
 
     # Step 1: Get identifier (explicit flag > auto-detect > interactive prompt)
-    if args.package:
-        package = args.package.strip()
-        print(f"\033[92m[+]\033[0m Package (from --package): \033[93m{package}\033[0m")
+    if package:
+        print(f"\033[92m[+]\033[0m Package: \033[93m{package}\033[0m")
     elif platform == 'android':
-        package = get_package_name_android(app_path)
+        base_apk = next((a for a in apk_list if os.path.basename(a).lower() == 'base.apk'), apk_list[0])
+        package = get_package_name_android(base_apk)
         if package:
             print(f"\033[92m[+]\033[0m Package: \033[93m{package}\033[0m")
         else:
             package = input("\033[93m[?] Enter package name manually: \033[0m").strip()
     else:
-        package = get_bundle_id_ios(app_path)
+        package = get_bundle_id_ios(source)
         if package:
             print(f"\033[92m[+]\033[0m Bundle ID: \033[93m{package}\033[0m")
         else:
@@ -1131,9 +1465,9 @@ def main():
 
     # Step 2: Extract Flutter binary
     if platform == 'android':
-        binary_path = extract_flutter_android(app_path, out_dir)
+        binary_path, abi = extract_flutter_android(apk_list, out_dir)
     else:
-        binary_path = extract_flutter_ios(app_path, out_dir)
+        binary_path = extract_flutter_ios(source, out_dir)
 
     if not binary_path:
         sys.exit(1)
@@ -1161,6 +1495,10 @@ def main():
         print_commands_ios(package, proxy, script_path, device_ip)
 
     print_summary(package, offset, script_path, proxy, platform)
+
+    # Step 6: (optional) spawn & verify the bypass actually loads
+    if args.run:
+        run_and_verify(package, script_path, serial, args.run_timeout)
 
 
 if __name__ == '__main__':

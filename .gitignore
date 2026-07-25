@@ -9,3 +9,5 @@ Flutter
 flutter_bypass.js
 *.apk
 *.ipa
+
+.DS_Store
