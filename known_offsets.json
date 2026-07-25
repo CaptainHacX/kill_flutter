@@ -3,6 +3,6 @@
     "offset": "0x73ee84",
     "sig": "fd7b01a9fc6f02a9fa6703a9f85f04a9",
     "platform": "android",
-    "note": "Flutter engine bundled with com.coindcx.btc 7.57.0002 (arm64-v8a)"
+    "note": "Flutter engine bundled with com.example.app (arm64-v8a)"
   }
 }
