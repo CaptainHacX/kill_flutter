@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Tool artifacts / extracted binaries
+libflutter.so
+Flutter
+flutter_bypass.js
+*.apk
+*.ipa
