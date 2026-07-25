@@ -4,7 +4,7 @@
 # Supports: Android (APK) + iOS (IPA)
 # For authorized penetration testing only
 
-import struct, re, sys, os, zipfile, subprocess, argparse, plistlib, socket, shutil
+import struct, re, sys, os, zipfile, subprocess, argparse, plistlib, socket, shutil, json, hashlib
 
 
 # ─────────────────────────────────────────────
@@ -82,6 +82,13 @@ def print_help():
   \033[92m--serial\033[0m            adb / Frida device serial (for --from-device and --run)
   \033[92m--run\033[0m               Spawn the app via Frida and verify the bypass actually loaded
   \033[92m--run-timeout\033[0m       Seconds to wait for the hook with --run (default 15)
+  \033[92m--no-cache\033[0m          Ignore the offset cache and always rescan
+  \033[92m--refresh-cache\033[0m     Rescan and overwrite the cached offset for this binary
+
+\033[93mNOTES:\033[0m
+  \033[90m- Offsets are cached by libflutter.so SHA-256 in ~/.kill_flutter/ (instant re-runs).\033[0m
+  \033[90m- The generated script also unpins Java-layer TLS (OkHttp/TrustManager) for\033[0m
+  \033[90m  hybrid apps; toggle ENABLE_TLS_UNPIN in the script to disable.\033[0m
 
 \033[93mINPUT TYPES (Android):\033[0m
   a single .apk, a folder of split APKs, an .xapk/.apks/.apkm bundle,
@@ -653,7 +660,7 @@ def extract_flutter_ios(ipa_path, out_dir):
 #  ELF SEGMENT PARSER (Android ARM64)
 # ─────────────────────────────────────────────
 
-def parse_elf_segments(data):
+def parse_elf_segments(data, verbose=True):
     """Returns (base_vaddr, code_foff, code_vaddr, code_filesz) for the executable segment."""
     if data[:4] != b'\x7fELF':
         return None, None, None, None
@@ -679,13 +686,14 @@ def parse_elf_segments(data):
             # PF_X
             if (p_flags & 1):
                 seg_filesz = struct.unpack_from('<Q', ph, 0x20)[0]
-                print(f"\033[96m[*]\033[0m ELF code segment: file={hex(p_offset)} vaddr={hex(p_vaddr)} size={hex(seg_filesz)}")
+                if verbose:
+                    print(f"\033[96m[*]\033[0m ELF code segment: file={hex(p_offset)} vaddr={hex(p_vaddr)} size={hex(seg_filesz)}")
                 # Added by CaptainHacX: a .so can have multiple executable PT_LOAD
                 # segments; keep the LARGEST one (the real .text), not the last parsed.
                 if code_filesz is None or seg_filesz > code_filesz:
                     code_foff, code_vaddr, code_filesz = p_offset, p_vaddr, seg_filesz
 
-    if code_foff is not None:
+    if code_foff is not None and verbose:
         print(f"\033[92m[+]\033[0m Selected code segment: file={hex(code_foff)} vaddr={hex(code_vaddr)} size={hex(code_filesz)}")
 
     if base_vaddr is None:
@@ -766,10 +774,110 @@ def parse_macho_segments(data):
 
 
 # ─────────────────────────────────────────────
+#  OFFSET CACHE + KNOWN-ENGINE DB   — Added by CaptainHacX
+# ─────────────────────────────────────────────
+#
+# The cache key is the SHA-256 of the exact libflutter.so bytes: identical bytes
+# => identical offset, so a hit is provably correct. Entries are additionally
+# byte-verified (Android) before use, so a corrupt/poisoned cache can never
+# produce a wrong hook — it just falls back to a full rescan.
+
+_CACHE_DIR  = os.path.join(os.path.expanduser('~'), '.kill_flutter')
+_CACHE_FILE = os.path.join(_CACHE_DIR, 'offset_cache.json')
+_BUNDLED_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'known_offsets.json')
+
+
+def _sha256_file(path):
+    """Stream SHA-256 of a file. Returns hex digest or None on error."""
+    try:
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _read_json(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _valid_cache_entry(entry):
+    """Schema-check a cache entry so garbage can never reach the hook path."""
+    if not isinstance(entry, dict):
+        return False
+    off = entry.get('offset')
+    sig = entry.get('sig', '')
+    try:
+        if not isinstance(off, str) or int(off, 16) < 0:
+            return False
+        if sig and (len(sig) % 2 or bytes.fromhex(sig) is None):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _lookup_offset(sha):
+    """Look up an offset entry by binary hash: user cache first, then the
+    bundled read-only DB. Returns a validated entry dict or None."""
+    if not sha:
+        return None
+    for store in (_read_json(_CACHE_FILE), _read_json(_BUNDLED_DB)):
+        entry = store.get(sha)
+        if entry and _valid_cache_entry(entry):
+            return entry
+    return None
+
+
+def _save_offset(sha, entry):
+    """Persist an entry to the user cache atomically. Never raises."""
+    if not sha or not _valid_cache_entry(entry):
+        return
+    try:
+        os.makedirs(_CACHE_DIR, mode=0o700, exist_ok=True)
+        store = _read_json(_CACHE_FILE)
+        store[sha] = entry
+        tmp = _CACHE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(store, f, indent=2, sort_keys=True)
+        os.replace(tmp, _CACHE_FILE)
+    except Exception:
+        pass  # cache is best-effort; never break the run
+
+
+def _verify_cached_offset(data, platform, rva, sig_hex):
+    """Confirm the cached offset really points at the expected prologue bytes.
+    Android: maps RVA->file offset via the ELF segments and compares. Other
+    platforms: require the signature bytes to be present in the binary."""
+    try:
+        sig = bytes.fromhex(sig_hex) if sig_hex else b''
+    except Exception:
+        return False
+    if len(sig) < 4:
+        return False
+    if platform == 'android':
+        base_vaddr, code_foff, code_vaddr, code_filesz = parse_elf_segments(data, verbose=False)
+        if code_foff is None:
+            return False
+        foff = (rva + base_vaddr) - code_vaddr + code_foff
+        if foff < 0 or foff + len(sig) > len(data):
+            return False
+        return data[foff:foff + len(sig)] == sig
+    return sig in data
+
+
+# ─────────────────────────────────────────────
 #  CORE — FIND SSL OFFSET (shared for both platforms)
 # ─────────────────────────────────────────────
 
-def find_offset(binary_path, platform):
+def find_offset(binary_path, platform, use_cache=True, refresh_cache=False):
     print(f"\033[96m[*]\033[0m Loading binary: {binary_path}")
     with open(binary_path, 'rb') as f:
         data = f.read()
@@ -787,6 +895,20 @@ def find_offset(binary_path, platform):
             print(f"\033[93m    This binary is {klass} {arch}. Use an arm64-v8a build/device, "
                   f"or analyze it manually.\033[0m")
             return None
+
+    # Added by CaptainHacX: offset cache / known-engine DB lookup (keyed by the
+    # binary's SHA-256). A hit skips the expensive ADRP scan entirely.
+    sha = _sha256_file(binary_path)
+    if use_cache and not refresh_cache and sha:
+        entry = _lookup_offset(sha)
+        if entry:
+            rva = int(entry['offset'], 16)
+            if _verify_cached_offset(data, platform, rva, entry.get('sig', '')):
+                print(f"\033[92m[+]\033[0m Cache hit ({sha[:12]}…) — SSL verify offset (RVA): "
+                      f"\033[93m{hex(rva)}\033[0m")
+                return rva
+            else:
+                print(f"\033[93m[!] Cached entry failed byte-verification — rescanning.\033[0m")
 
     # Find string anchors
     ssl_client = [m.start() for m in re.finditer(b'ssl_client\x00', data)]
@@ -856,6 +978,10 @@ def find_offset(binary_path, platform):
                         rva = foff_to_rva(i)
                         print(f"\033[92m[+]\033[0m SSL verify offset (RVA): \033[93m{hex(rva)}\033[0m")
                         print(f"\033[92m[+]\033[0m First bytes: {data[i:i+16].hex(' ')}")
+                        # Added by CaptainHacX: persist to the offset cache
+                        if use_cache and sha:
+                            _save_offset(sha, {'offset': hex(rva), 'sig': data[i:i+16].hex(),
+                                               'platform': platform})
                         return rva
 
     print("\033[91m[-] Could not find SSL verify function\033[0m")
@@ -889,6 +1015,7 @@ def write_frida_script(offset, package, platform, out_path):
 var ENABLE_SSL_BYPASS   = true;
 var ENABLE_ROOT_BYPASS  = true;
 var ENABLE_FRIDA_HIDE   = true;
+var ENABLE_TLS_UNPIN    = true;   // Added by CaptainHacX: OkHttp/TrustManager (hybrid apps)
 
 // ---- auto-filled by kill_flutter.py ----
 var SSL_VERIFY_OFFSET = {hex(offset)};
@@ -1049,9 +1176,77 @@ function hookJava() {
     });
 }
 
+// ---------------- TLS UNPINNING (Java layer: OkHttp / TrustManager) ----------------
+// Added by CaptainHacX: covers hybrid Flutter apps that pin at the Java layer
+// (OkHttp CertificatePinner, Conscrypt TrustManagerImpl, custom TrustManagers,
+// the http_certificate_pinning plugin). Every hook is independently guarded so a
+// missing class is a no-op and can never break the native SSL/root hooks.
+function hookTls() {
+    if (!ENABLE_TLS_UNPIN) return;
+    if (typeof Java === "undefined" || !Java.available) return;
+    Java.perform(function () {
+
+        // OkHttp3 CertificatePinner.check(...) -> no-op (all overloads)
+        try {
+            var CP = Java.use("okhttp3.CertificatePinner");
+            CP.check.overloads.forEach(function (ov) {
+                try {
+                    ov.implementation = function () {
+                        log("[tls] okhttp CertificatePinner.check bypassed");
+                        return;
+                    };
+                } catch (e) {}
+            });
+        } catch (e) {}
+
+        // Conscrypt TrustManagerImpl.verifyChain(...) -> return the chain (trusted)
+        try {
+            var TMI = Java.use("com.android.org.conscrypt.TrustManagerImpl");
+            if (TMI.verifyChain) {
+                TMI.verifyChain.implementation = function (untrustedChain, trustAnchorChain,
+                                                           host, clientAuth, ocspData, tlsSctData) {
+                    log("[tls] conscrypt verifyChain bypassed (" + host + ")");
+                    return untrustedChain;
+                };
+            }
+        } catch (e) {}
+
+        // Inject a trust-all X509TrustManager via SSLContext.init(...)
+        try {
+            var X509TM = Java.use("javax.net.ssl.X509TrustManager");
+            var SSLContext = Java.use("javax.net.ssl.SSLContext");
+            var TrustAll = Java.registerClass({
+                name: "com.killflutter.TrustAll",
+                implements: [X509TM],
+                methods: {
+                    checkClientTrusted: function (chain, authType) {},
+                    checkServerTrusted: function (chain, authType) {},
+                    getAcceptedIssuers: function () { return []; }
+                }
+            });
+            var init = SSLContext.init.overload(
+                '[Ljavax.net.ssl.KeyManager;', '[Ljavax.net.ssl.TrustManager;', 'java.security.SecureRandom');
+            init.implementation = function (km, tm, sr) {
+                log("[tls] SSLContext.init -> trust-all TrustManager");
+                init.call(this, km, [TrustAll.$new()], sr);
+            };
+        } catch (e) {}
+
+        // HostnameVerifier -> allow all
+        try {
+            var HUC = Java.use("javax.net.ssl.HttpsURLConnection");
+            try { HUC.setDefaultHostnameVerifier.implementation = function (v) { log("[tls] setDefaultHostnameVerifier ignored"); }; } catch (e) {}
+            try { HUC.setHostnameVerifier.implementation = function (v) { log("[tls] setHostnameVerifier ignored"); }; } catch (e) {}
+        } catch (e) {}
+
+        log("[tls] Java-layer unpinning installed");
+    });
+}
+
 // ---------------- RUN ----------------
 try { hookLibc(); } catch (e) { log("libc error: " + e); }
 try { hookJava(); } catch (e) { log("java error: " + e); }
+try { hookTls(); } catch (e) { log("tls error: " + e); }
 hookSslVerify();
 log("bypass loaded");
 '''
@@ -1382,6 +1577,11 @@ def main():
                         help='After generating, spawn the app via Frida and verify the bypass loaded')
     parser.add_argument('--run-timeout', type=int, default=15,
                         help='Seconds to wait for the hook when using --run (default 15)')
+    # Added by CaptainHacX: offset cache controls
+    parser.add_argument('--no-cache', action='store_true',
+                        help='Ignore the offset cache and always rescan')
+    parser.add_argument('--refresh-cache', action='store_true',
+                        help='Rescan and overwrite the cached offset for this binary')
     args = parser.parse_args()
 
     print_banner()
@@ -1481,8 +1681,9 @@ def main():
     if not binary_path:
         sys.exit(1)
 
-    # Step 3: Find SSL offset
-    offset = find_offset(binary_path, platform)
+    # Step 3: Find SSL offset (uses the offset cache unless --no-cache)
+    offset = find_offset(binary_path, platform,
+                         use_cache=not args.no_cache, refresh_cache=args.refresh_cache)
     if offset is None:
         sys.exit(1)
 
