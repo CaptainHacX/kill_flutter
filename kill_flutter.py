@@ -186,7 +186,8 @@ def detect_platform(file_path, forced=None):
 
 def get_package_name_android(apk_path):
     """Resolve the package name with a graceful fallback chain so the tool does
-    NOT hard-depend on aapt: aapt -> aapt2 -> binary-AndroidManifest parser."""
+    NOT hard-depend on aapt: aapt -> aapt2 -> binary-AndroidManifest parser.
+    Added by CaptainHacX: the aapt2 + binary-manifest fallbacks."""
     # 1) aapt (if present)
     try:
         result = subprocess.run(['aapt', 'dump', 'badging', apk_path],
@@ -224,7 +225,8 @@ def get_package_name_android(apk_path):
 
 def _parse_package_from_axml(apk_path):
     """Extract the `package` attribute of <manifest> from an APK's binary
-    AndroidManifest.xml without aapt. Fully defensive: returns None on any error."""
+    AndroidManifest.xml without aapt. Fully defensive: returns None on any error.
+    Added by CaptainHacX."""
     try:
         with zipfile.ZipFile(apk_path, 'r') as z:
             axml = z.read('AndroidManifest.xml')
@@ -326,7 +328,7 @@ def get_bundle_id_ios(ipa_path):
 
 
 # ─────────────────────────────────────────────
-#  DEVICE / INPUT HELPERS  (--from-device, bundles, dirs)
+#  DEVICE / INPUT HELPERS  (--from-device, bundles, dirs)   — Added by CaptainHacX
 # ─────────────────────────────────────────────
 
 ABI_PREFERENCE = ['arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86']
@@ -436,7 +438,7 @@ def list_android_apks(input_path, out_dir):
 
 
 # ─────────────────────────────────────────────
-#  HOST IP AUTO-DETECTION
+#  HOST IP AUTO-DETECTION   — Added by CaptainHacX
 # ─────────────────────────────────────────────
 
 def detect_host_ip():
@@ -464,7 +466,7 @@ def detect_host_ip():
 
 
 # ─────────────────────────────────────────────
-#  PROTECTION / RASP SCANNER
+#  PROTECTION / RASP SCANNER   — Added by CaptainHacX
 # ─────────────────────────────────────────────
 
 def scan_protections(targets, platform):
@@ -584,7 +586,8 @@ def scan_protections(targets, platform):
 def extract_flutter_android(apks, out_dir):
     """Find & extract libflutter.so from a list of APK paths (base + splits).
     Searches every APK and every ABI, preferring arm64-v8a.
-    Returns (so_path, abi) or (None, None)."""
+    Returns (so_path, abi) or (None, None).
+    Added by CaptainHacX: multi-APK / multi-ABI search (was arm64-only, single APK)."""
     if not apks:
         print("\033[91m[-] No .apk found in the given input.\033[0m")
         return None, None
@@ -677,8 +680,8 @@ def parse_elf_segments(data):
             if (p_flags & 1):
                 seg_filesz = struct.unpack_from('<Q', ph, 0x20)[0]
                 print(f"\033[96m[*]\033[0m ELF code segment: file={hex(p_offset)} vaddr={hex(p_vaddr)} size={hex(seg_filesz)}")
-                # A .so can have multiple executable PT_LOAD segments; keep the
-                # LARGEST one (the real .text), not simply the last one parsed.
+                # Added by CaptainHacX: a .so can have multiple executable PT_LOAD
+                # segments; keep the LARGEST one (the real .text), not the last parsed.
                 if code_filesz is None or seg_filesz > code_filesz:
                     code_foff, code_vaddr, code_filesz = p_offset, p_vaddr, seg_filesz
 
@@ -771,8 +774,8 @@ def find_offset(binary_path, platform):
     with open(binary_path, 'rb') as f:
         data = f.read()
 
-    # Arch gate (Android/ELF): the ADRP+ADD scanner is AArch64-only. Refuse to
-    # guess on other architectures rather than emit a wrong (dangerous) offset.
+    # Added by CaptainHacX: arch gate (Android/ELF). The ADRP+ADD scanner is
+    # AArch64-only; refuse other architectures rather than emit a wrong offset.
     if platform == 'android' and len(data) >= 0x14 and data[:4] == b'\x7fELF':
         ei_class  = data[4]                                    # 1=32-bit, 2=64-bit
         e_machine = struct.unpack_from('<H', data, 0x12)[0]    # 0xB7 = AArch64
@@ -864,6 +867,8 @@ def find_offset(binary_path, platform):
 # ─────────────────────────────────────────────
 
 def write_frida_script(offset, package, platform, out_path):
+    # Added by CaptainHacX: emits a COMBINED script (SSL pinning + root/anti-Frida
+    # bypass) with a Frida-17 export resolver, instead of the original SSL-only one.
     # Module name differs between platforms
     module_name = 'libflutter.so' if platform == 'android' else 'Flutter'
 
@@ -915,8 +920,8 @@ function pathIsBlocked(path) {
     return false;
 }
 
-// Resolve a libc export across Frida versions. Frida 17 removed the static
-// Module.findExportByName(null, name); the replacement is
+// Added by CaptainHacX: resolve a libc export across Frida versions. Frida 17
+// removed the static Module.findExportByName(null, name); the replacement is
 // Module.findGlobalExportByName(name).
 function resolveExport(name) {
     try { if (typeof Module.findGlobalExportByName === "function") return Module.findGlobalExportByName(name); } catch (e) {}
@@ -1057,7 +1062,7 @@ log("bypass loaded");
 
 
 # ─────────────────────────────────────────────
-#  ANDROID — FRIDA-SERVER PRE-FLIGHT CHECK
+#  ANDROID — FRIDA-SERVER PRE-FLIGHT CHECK   — Added by CaptainHacX
 # ─────────────────────────────────────────────
 
 def preflight_frida_check(package):
@@ -1164,7 +1169,7 @@ def preflight_frida_check(package):
 
 
 # ─────────────────────────────────────────────
-#  RUN & VERIFY  (--run)
+#  RUN & VERIFY  (--run)   — Added by CaptainHacX
 # ─────────────────────────────────────────────
 
 def run_and_verify(package, script_path, serial, run_timeout):
@@ -1363,10 +1368,12 @@ def main():
     parser.add_argument('-o', '--output', help='Output directory')
     parser.add_argument('--platform', choices=['android', 'ios'], help='Force platform')
     parser.add_argument('--device-ip', default='<DEVICE_IP>', help='iOS device IP (for SSH iptables)')
+    # Added by CaptainHacX: --package/--bundle-id and --no-scan
     parser.add_argument('--package', '--bundle-id', dest='package', default=None,
                         help='Explicit package name / bundle id (skips auto-detection and the interactive prompt)')
     parser.add_argument('--no-scan', action='store_true',
                         help='Skip the protection/RASP pre-scan')
+    # Added by CaptainHacX: new feature flags (--from-device, --serial, --run, --run-timeout)
     parser.add_argument('--from-device', metavar='PACKAGE', default=None,
                         help='Pull the app (all splits) from a connected device by package name (Android)')
     parser.add_argument('--serial', default=None,
@@ -1379,6 +1386,8 @@ def main():
 
     print_banner()
 
+    # Added by CaptainHacX: input acquisition (--from-device pull, dir/bundle
+    # inputs), auto host-IP, protection pre-scan, and the optional --run step.
     serial = args.serial
     package = args.package.strip() if args.package else None
     source_display = args.app
@@ -1421,7 +1430,7 @@ def main():
         source = app_path
         source_display = app_path
 
-    # ---- Proxy / IP ----
+    # ---- Proxy / IP ----  (auto host-IP added by CaptainHacX)
     ip = args.ip
     if ip == '<YOUR_IP>':
         detected = detect_host_ip()
@@ -1437,12 +1446,12 @@ def main():
     print(f"\033[96m[*]\033[0m Output   : {out_dir}")
     print(f"\033[96m[*]\033[0m Proxy    : {proxy}")
 
-    # Normalize Android input into a concrete list of APKs (base + splits)
+    # Normalize Android input into a concrete list of APKs (base + splits)  — Added by CaptainHacX
     apk_list = list_android_apks(source, out_dir) if platform == 'android' else []
     if platform == 'android' and not apk_list:
         print("\033[91m[-] No APK found in the given input.\033[0m"); sys.exit(1)
 
-    # Step 0: Protection / RASP pre-scan (warn before we hit a runtime crash)
+    # Step 0: Protection / RASP pre-scan (warn before we hit a runtime crash)  — Added by CaptainHacX
     if not args.no_scan:
         scan_protections(apk_list if platform == 'android' else [source], platform)
 
@@ -1496,7 +1505,7 @@ def main():
 
     print_summary(package, offset, script_path, proxy, platform)
 
-    # Step 6: (optional) spawn & verify the bypass actually loads
+    # Step 6: (optional) spawn & verify the bypass actually loads  — Added by CaptainHacX
     if args.run:
         run_and_verify(package, script_path, serial, args.run_timeout)
 
