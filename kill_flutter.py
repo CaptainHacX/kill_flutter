@@ -4,7 +4,7 @@
 # Supports: Android (APK) + iOS (IPA)
 # For authorized penetration testing only
 
-import struct, re, sys, os, zipfile, subprocess, argparse
+import struct, re, sys, os, zipfile, subprocess, argparse, plistlib
 
 
 # ─────────────────────────────────────────────
@@ -169,13 +169,16 @@ def get_bundle_id_ios(ipa_path):
             for name in z.namelist():
                 if re.match(r'Payload/[^/]+\.app/Info\.plist$', name):
                     with z.open(name) as f:
-                        content = f.read().decode('utf-8', errors='ignore')
-                    # Simple regex parse for CFBundleIdentifier
-                    m = re.search(r'CFBundleIdentifier.*?<string>(.*?)</string>', content, re.DOTALL)
-                    if m:
-                        return m.group(1).strip()
+                        content = f.read()
+                    
+                    try:
+                        plist_data = plistlib.loads(content)
+                        if 'CFBundleIdentifier' in plist_data:
+                            return plist_data['CFBundleIdentifier'].strip()
+                    except Exception as parse_e:
+                        print(f"\033[93m[!] Could not parse Info.plist data: {parse_e}\033[0m")
     except Exception as e:
-        print(f"\033[93m[!] Could not parse Info.plist: {e}\033[0m")
+        print(f"\033[93m[!] Could not read Info.plist from zip: {e}\033[0m")
     return None
 
 
@@ -220,33 +223,44 @@ def extract_flutter_ios(ipa_path, out_dir):
 # ─────────────────────────────────────────────
 
 def parse_elf_segments(data):
-    """Returns (code_foff, code_vaddr, code_filesz) for the executable segment."""
+    """Returns (base_vaddr, code_foff, code_vaddr, code_filesz) for the executable segment."""
     if data[:4] != b'\x7fELF':
-        return None, None, None
+        return None, None, None, None
 
     e_phoff     = struct.unpack_from('<Q', data, 0x20)[0]
     e_phentsize = struct.unpack_from('<H', data, 0x36)[0]
     e_phnum     = struct.unpack_from('<H', data, 0x38)[0]
 
+    base_vaddr = None
     code_foff = code_vaddr = code_filesz = None
+    
     for i in range(e_phnum):
         ph      = data[e_phoff + i*e_phentsize : e_phoff + (i+1)*e_phentsize]
         p_type  = struct.unpack_from('<I', ph, 0x00)[0]
         p_flags = struct.unpack_from('<I', ph, 0x04)[0]
-        if p_type == 1 and (p_flags & 1):  # PT_LOAD + PF_X
-            seg_foff   = struct.unpack_from('<Q', ph, 0x08)[0]
-            seg_vaddr  = struct.unpack_from('<Q', ph, 0x10)[0]
-            seg_filesz = struct.unpack_from('<Q', ph, 0x20)[0]
-            print(f"\033[96m[*]\033[0m ELF code segment: file={hex(seg_foff)} vaddr={hex(seg_vaddr)} size={hex(seg_filesz)}")
-            # A .so can have multiple executable PT_LOAD segments; keep the
-            # LARGEST one (the real .text), not simply the last one parsed.
-            if code_filesz is None or seg_filesz > code_filesz:
-                code_foff, code_vaddr, code_filesz = seg_foff, seg_vaddr, seg_filesz
+        p_offset = struct.unpack_from('<Q', ph, 0x08)[0]
+        p_vaddr  = struct.unpack_from('<Q', ph, 0x10)[0]
+
+        # PT_LOAD
+        if p_type == 1:
+            if p_offset == 0 and base_vaddr is None:
+                base_vaddr = p_vaddr
+            # PF_X
+            if (p_flags & 1):
+                seg_filesz = struct.unpack_from('<Q', ph, 0x20)[0]
+                print(f"\033[96m[*]\033[0m ELF code segment: file={hex(p_offset)} vaddr={hex(p_vaddr)} size={hex(seg_filesz)}")
+                # A .so can have multiple executable PT_LOAD segments; keep the
+                # LARGEST one (the real .text), not simply the last one parsed.
+                if code_filesz is None or seg_filesz > code_filesz:
+                    code_foff, code_vaddr, code_filesz = p_offset, p_vaddr, seg_filesz
 
     if code_foff is not None:
         print(f"\033[92m[+]\033[0m Selected code segment: file={hex(code_foff)} vaddr={hex(code_vaddr)} size={hex(code_filesz)}")
 
-    return code_foff, code_vaddr, code_filesz
+    if base_vaddr is None:
+        base_vaddr = 0
+        
+    return base_vaddr, code_foff, code_vaddr, code_filesz
 
 
 # ─────────────────────────────────────────────
@@ -254,8 +268,8 @@ def parse_elf_segments(data):
 # ─────────────────────────────────────────────
 
 def parse_macho_segments(data):
-    """Returns (code_foff, code_vaddr, code_filesz, data) for __TEXT executable segment.
-    Always returns a 4-tuple; data may be a sliced arm64 view of a fat binary."""
+    """Returns (base_vaddr, code_foff, code_vaddr, code_filesz, data) for __TEXT executable segment.
+    Always returns a 5-tuple; data may be a sliced arm64 view of a fat binary."""
 
     MH_MAGIC_64    = 0xFEEDFACF  # 64-bit little-endian
     FAT_MAGIC      = 0xCAFEBABE  # Fat binary (big-endian)
@@ -281,11 +295,12 @@ def parse_macho_segments(data):
 
     if magic != MH_MAGIC_64:
         print(f"\033[91m[-] Not a valid Mach-O 64-bit binary (magic={hex(magic)})\033[0m")
-        return None, None, None, data
+        return None, None, None, None, data
 
     ncmds    = struct.unpack_from('<I', data, 16)[0]
     cmd_off  = 32  # sizeof mach_header_64
 
+    base_vaddr = None
     code_foff = code_vaddr = code_filesz = None
 
     for _ in range(ncmds):
@@ -300,6 +315,9 @@ def parse_macho_segments(data):
             fileoff  = struct.unpack_from('<Q', data, cmd_off + 40)[0]
             filesize = struct.unpack_from('<Q', data, cmd_off + 48)[0]
             maxprot  = struct.unpack_from('<I', data, cmd_off + 56)[0]
+            
+            if fileoff == 0 and base_vaddr is None:
+                base_vaddr = vmaddr
 
             # __TEXT segment with execute permission (VM_PROT_EXECUTE = 4)
             if segname == '__TEXT' and (maxprot & 4):
@@ -309,8 +327,11 @@ def parse_macho_segments(data):
                 print(f"\033[96m[*]\033[0m Mach-O __TEXT segment: file={hex(fileoff)} vaddr={hex(vmaddr)} size={hex(filesize)}")
 
         cmd_off += cmdsize
+        
+    if base_vaddr is None:
+        base_vaddr = 0
 
-    return code_foff, code_vaddr, code_filesz, data  # return possibly-sliced data
+    return base_vaddr, code_foff, code_vaddr, code_filesz, data  # return possibly-sliced data
 
 
 # ─────────────────────────────────────────────
@@ -335,9 +356,9 @@ def find_offset(binary_path, platform):
 
     # Parse segments based on platform
     if platform == 'android':
-        code_foff, code_vaddr, code_filesz = parse_elf_segments(data)
+        base_vaddr, code_foff, code_vaddr, code_filesz = parse_elf_segments(data)
     else:
-        code_foff, code_vaddr, code_filesz, data = parse_macho_segments(data)
+        base_vaddr, code_foff, code_vaddr, code_filesz, data = parse_macho_segments(data)
         # Re-find strings in possibly-sliced data
         ssl_client = [m.start() for m in re.finditer(b'ssl_client\x00', data)]
         ssl_server  = [m.start() for m in re.finditer(b'ssl_server\x00', data)]
@@ -351,6 +372,9 @@ def find_offset(binary_path, platform):
 
     def foff_to_vaddr(fo):
         return fo - code_foff + code_vaddr
+        
+    def foff_to_rva(fo):
+        return (fo - code_foff + code_vaddr) - base_vaddr
 
     def find_refs(target_va):
         lo12 = target_va & 0xfff
@@ -384,10 +408,10 @@ def find_offset(binary_path, platform):
                 for i in range(start, max(code_foff, start - 0x300), -4):
                     instr = struct.unpack_from('<I', data, i)[0]
                     if (instr & 0xff8003ff) == 0xd10003ff or (instr & 0xffe07fff) == 0xa9007bfd:
-                        vaddr = foff_to_vaddr(i)
-                        print(f"\033[92m[+]\033[0m SSL verify offset: \033[93m{hex(vaddr)}\033[0m")
+                        rva = foff_to_rva(i)
+                        print(f"\033[92m[+]\033[0m SSL verify offset (RVA): \033[93m{hex(rva)}\033[0m")
                         print(f"\033[92m[+]\033[0m First bytes: {data[i:i+16].hex(' ')}")
-                        return vaddr
+                        return rva
 
     print("\033[91m[-] Could not find SSL verify function\033[0m")
     return None
@@ -470,7 +494,7 @@ function hookSslVerify() {
             var addr = m.base.add(SSL_VERIFY_OFFSET);
             log("[ssl] " + FLUTTER_MODULE + " base " + m.base + " -> hook " + addr);
             try {
-                Interceptor.attach(addr, { onLeave: function (retval) { retval.replace(0x1); } });
+                Interceptor.attach(addr, { onLeave: function (retval) { retval.replace(ptr("0x1")); } });
                 log("[ssl] pinning bypass installed");
             } catch (e) { log("[ssl] attach failed: " + e); }
         } else if (++tries > 150) {
