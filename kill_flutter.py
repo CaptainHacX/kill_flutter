@@ -121,7 +121,7 @@ def print_help():
   python3 kill_flutter.py --from-device com.example.app
 
   \033[90m# Folder of split APKs, or an .xapk/.apks bundle\033[0m
-  python3 kill_flutter.py ./coindcx_splits/
+  python3 kill_flutter.py ./app_splits/
   python3 kill_flutter.py app.xapk
 
   \033[90m# Generate AND auto-verify the bypass on-device (spawns via Frida)\033[0m
